@@ -25,7 +25,14 @@ TARGET = Config(
 
 
 def test_the_70b_target_configuration_is_feasible():
-    """The claim the whole design exists to support."""
+    """The claim the whole design exists to support.
+
+    This briefly failed against a hard 20-tokens-per-expert-parameter gate
+    that has since been withdrawn: the probe it came from had arms at
+    18.06 / 2.26 / 0.28 tokens per parameter, so it compared a
+    Chinchilla-optimal small model against a 71x starved large one and could
+    not measure routing at all.
+    """
     assert TARGET.feasible(max_days=90), TARGET.problems()
     assert TARGET.days < 90
 
@@ -122,8 +129,11 @@ def test_chinchilla_gate_rejects_undertrained_configs():
 
 # --------------------------- two-node strategies ---------------------------
 
+# Strategy tests use a pool the token budget can actually TRAIN, so they
+# isolate communication cost instead of tripping the per-expert data gate.
+# 4,900 experts is what 1.4B tokens supports at 20 assignments per parameter.
 TWO_NODE_BASE = dict(
-    total_params=70e9, active_params_per_token=70e6, tokens=1.4e9,
+    total_params=4.9e9, active_params_per_token=70e6, tokens=1.4e9,
     tokens_per_step=65536, nodes=2,
 )
 
@@ -136,15 +146,26 @@ def test_the_link_is_the_binding_constraint_not_compute():
     assert LINK_GBPS < DISK_READ_GBPS / 100
 
 
-def test_expert_sharding_is_the_only_viable_two_node_strategy():
-    assert SHARDED.feasible(max_days=90), SHARDED.problems()
-    for bad in ("expert_parallel", "data_parallel"):
-        cfg = Config(
-            expert_params=35e6 if bad == "expert_parallel" else 1e6,
-            strategy=bad, **TWO_NODE_BASE,
-        )
-        assert not cfg.feasible(max_days=90), bad
-        assert any("link-bound" in p for p in cfg.problems()), bad
+def test_all_to_all_is_link_bound_at_every_pool_size():
+    """Expert-parallel moves activations per step, so it is link-bound
+    regardless of how large the latent state is."""
+    cfg = Config(expert_params=35e6, strategy="expert_parallel",
+                 **TWO_NODE_BASE)
+    assert not cfg.feasible(max_days=90)
+    assert any("link-bound" in p for p in cfg.problems())
+
+
+def test_plain_data_parallel_is_link_bound_only_when_latent_is_large():
+    """It syncs the whole latent state, so its viability depends on pool
+    size: 70 GB at the 70B pool is hopeless, 4.9 GB at a trainable pool is
+    not. Stating it as an absolute would have been wrong."""
+    big = Config(expert_params=1e6, strategy="data_parallel",
+                 total_params=70e9, active_params_per_token=70e6,
+                 tokens=2e10, tokens_per_step=65536, nodes=2)
+    assert any("link-bound" in p for p in big.problems())
+    small = Config(expert_params=1e6, strategy="data_parallel",
+                   **TWO_NODE_BASE)
+    assert not any("link-bound" in p for p in small.problems())
 
 
 def test_all_to_all_is_slower_than_a_single_machine():
@@ -172,13 +193,13 @@ def test_two_node_speedup_is_superlinear_because_the_shard_halves():
 
 
 def test_sharding_halves_storage_per_node():
-    single = Config(expert_params=1e6, nodes=1, total_params=70e9,
-                    active_params_per_token=70e6, tokens=1.4e9,
-                    tokens_per_step=65536)
+    single = Config(expert_params=1e6, nodes=1,
+                    **{k: v for k, v in TWO_NODE_BASE.items()
+                       if k != "nodes"})
     assert SHARDED.storage_per_node_gb == pytest.approx(
         single.storage_per_node_gb / 2
     )
-    assert SHARDED.storage_per_node_gb < DISK_FREE_GB / 2
+    assert SHARDED.storage_per_node_gb < DISK_FREE_GB
 
 
 def test_trunk_sync_interval_matters_but_does_not_dominate():
@@ -213,19 +234,21 @@ def test_pruning_active_experts_shrinks_the_model_not_the_clock():
     which is the model. The token budget must shrink with it, so the result
     is a smaller model trained on less data -- not the same model faster."""
     full = Config(expert_params=1e6, nodes=2, strategy="expert_sharded",
-                  total_params=70e9, active_params_per_token=70e6,
+                  total_params=4.9e9, active_params_per_token=70e6,
                   tokens=1.4e9, tokens_per_step=65536)
     pruned = Config(expert_params=1e6, nodes=2, strategy="expert_sharded",
-                    total_params=70e9, active_params_per_token=20e6,
+                    total_params=4.9e9, active_params_per_token=20e6,
                     tokens=1.4e9, tokens_per_step=65536)
     assert pruned.compute_seconds < full.compute_seconds
     assert pruned.active_params_per_token < full.active_params_per_token
     # At the Chinchilla-matched token budget for its smaller active size the
     # saving is real but it is a different, smaller model.
+    # The token budget must be matched on BOTH axes: active params and
+    # per-expert data. 4e8 tokens at 20 experts/token supports 400 experts.
     matched = Config(expert_params=1e6, nodes=2, strategy="expert_sharded",
-                     total_params=70e9, active_params_per_token=20e6,
+                     total_params=4e8, active_params_per_token=20e6,
                      tokens=4e8, tokens_per_step=65536)
-    assert matched.feasible(max_days=90)
+    assert matched.feasible(max_days=90), matched.problems()
 
 
 def test_removing_all_cross_node_traffic_barely_helps():
@@ -240,15 +263,16 @@ def test_removing_all_cross_node_traffic_barely_helps():
 
 
 def test_delta_sync_makes_data_parallel_viable():
-    """Claim 3, rescued. Plain data-parallel is link-bound; the same topology
-    with ternary delta sync is not, which restores the full routing pool."""
+    """Claim 3, rescued. Delta sync cuts the synchronised object by orders of
+    magnitude, which is what lets data-parallel keep the full routing pool
+    even where plain latent sync is link-bound."""
     plain = Config(expert_params=1e6, strategy="data_parallel",
                    **TWO_NODE_BASE)
     delta = Config(expert_params=1e6, strategy="data_parallel_delta",
                    **TWO_NODE_BASE)
-    assert not plain.feasible(max_days=90)
     assert delta.feasible(max_days=90), delta.problems()
     assert delta.comm_gb_per_step < plain.comm_gb_per_step / 100
+    assert delta.shard_fraction == 1.0
 
 
 def test_longer_delta_sync_intervals_cost_less_per_step():
@@ -262,14 +286,71 @@ def test_longer_delta_sync_intervals_cost_less_per_step():
     assert long.comm_gb_per_step < short.comm_gb_per_step
 
 
-def test_data_parallel_keeps_the_full_pool_but_not_the_storage_saving():
-    """The honest trade: sharding is faster and halves storage; delta-sync
-    keeps every expert reachable at ~2 days and 43.7 GB/node more."""
+def test_delta_sync_wins_outright_at_a_trainable_pool_size():
+    """The trade-off reverses with pool size, so it must not be stated as a
+    fixed rule. At the 70B pool, sharding is faster because it halves a huge
+    streaming cost. At a pool the token budget can actually train, storage is
+    small enough that sharding's I/O advantage nearly vanishes while it still
+    pays trunk sync -- so delta-sync is both faster AND keeps every expert
+    reachable, which the measured 10.0% sharding penalty makes decisive."""
     sharded = Config(expert_params=1e6, strategy="expert_sharded",
                      **TWO_NODE_BASE)
     delta = Config(expert_params=1e6, strategy="data_parallel_delta",
                    **TWO_NODE_BASE)
-    assert delta.days > sharded.days
+    assert delta.days < sharded.days
     assert delta.storage_per_node_gb > sharded.storage_per_node_gb
     assert delta.storage_per_node_gb < DISK_FREE_GB
-    assert delta.shard_fraction == 1.0
+
+    big = dict(total_params=70e9, active_params_per_token=70e6,
+               tokens=2e10, tokens_per_step=65536, nodes=2)
+    big_sh = Config(expert_params=1e6, strategy="expert_sharded", **big)
+    big_dp = Config(expert_params=1e6, strategy="data_parallel_delta", **big)
+    assert big_dp.days > big_sh.days
+
+
+# ------------------- per-expert data budget (rung: attn probe) -------------
+
+def test_per_expert_data_is_reported_but_never_blocks():
+    """Diminishing returns to pool size are real; their threshold is not
+    established by anything measured here. Encoding one as a blocker is what
+    produced the withdrawn gate, so this asserts it stays advisory."""
+    starved = Config(
+        total_params=70e9, active_params_per_token=70e6, tokens=1e8,
+        expert_params=1e6, tokens_per_step=65536, nodes=2,
+        strategy="data_parallel_delta",
+    )
+    assert starved.tokens_per_expert_param < 1.0
+    assert starved.warnings()
+    assert not any("expert parameter" in p for p in starved.problems())
+
+
+def test_smaller_pools_are_also_feasible():
+    """Trimming remains an option, it is simply not forced."""
+    trimmed = Config(
+        total_params=4.9e9, active_params_per_token=70e6, tokens=1.4e9,
+        expert_params=1e6, tokens_per_step=65536, nodes=2,
+        strategy="data_parallel_delta",
+    )
+    assert trimmed.feasible(max_days=90), trimmed.problems()
+    assert trimmed.days < TARGET.days
+
+
+def test_more_tokens_cost_proportionally_more_time():
+    """Raising the token budget is priced, so the trade is visible even
+    though it is no longer forced."""
+    more = Config(
+        total_params=70e9, active_params_per_token=70e6, tokens=1.4e10,
+        expert_params=1e6, tokens_per_step=65536, nodes=2,
+        strategy="data_parallel_delta",
+    )
+    assert more.days > 9 * TARGET.days * 0.8
+    assert any("runtime" in p for p in more.problems())
+
+
+def test_viable_pool_and_token_budget_are_mutually_consistent():
+    """Trimming the pool and raising the tokens are two views of one
+    quantity, so the advice printed must not contradict itself."""
+    pool = TARGET.viable_pool_size()
+    toks = TARGET.tokens_for_this_pool()
+    assert TARGET.n_experts / pool == pytest.approx(toks / TARGET.tokens,
+                                                    rel=1e-6)

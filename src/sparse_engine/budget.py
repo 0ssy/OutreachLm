@@ -66,12 +66,31 @@ WHAT THIS DOES NOT CLAIM
     A 70B-total / 70M-active model is not a 70B dense model. Published MoE
     runs use far lower sparsity ratios -- Mixtral is 47B/13B (3.6x), Switch
     Transformer explored up to roughly 100x with measurable degradation. At
-    1000x this design is well outside demonstrated territory, and the honest
-    expectation is quality somewhere between a 70M and a few-hundred-M dense
-    model, with the 70B table acting as addressable memory rather than as
-    effective capacity. That is an empirical question this accounting cannot
-    settle; it is a risk to the QUALITY of the result, not to its FEASIBILITY,
-    and it is the reason the routing quality experiment must come early.
+    1000x this design is well outside demonstrated territory.
+
+    ROUTING EVIDENCE, AS IT STANDS AFTER MEASUREMENT
+      * On a task where routing IS the bottleneck by construction (tokens
+        carry a latent concept, the target is a concept-specific map), larger
+        pools keep helping to a 1024x sparsity ratio and the gap WIDENS with
+        training: relative loss 0.00018 / 0.00007 / 0.00005 for 128 / 512 /
+        2048 experts at 5400 steps. An earlier flat reading at 900 steps was
+        an optimisation floor, not a result.
+      * On REAL text (the project's own 3.22 MB corpus, character-level, no
+        residual bypass so the expert block is the only path to the head),
+        pool size makes NO measurable difference: 2.4724 / 2.4736 / 2.4729 for
+        8 / 64 / 512 experts. Sharding costs 0.58%.
+
+    The most likely reading is that the language probe's trunk is too weak to
+    expose structure worth routing on -- it mean-pools context and has no
+    attention, so tokens look alike to the router regardless of how many
+    experts are available. A router cannot discover structure the
+    representation does not represent. That is consistent with production MoE,
+    where expert layers sit inside attention blocks.
+
+    So the large-table design is SUPPORTED on synthetic routing tasks and
+    UNVALIDATED on language. Resolving it needs a trunk with attention, which
+    is a materially larger experiment than anything run so far, and it is the
+    single most important open risk to this architecture.
 
 MEASURED CONSTANTS -- all from this machine, none assumed.
 """
@@ -104,9 +123,11 @@ LINK_RTT_MS = 0.80
 
 # src/sparse_engine/run_delta_probe.py -- ternary delta coding against the
 # PACKED 2-BIT form (not fp32, which would inflate the figure 16x for free).
-# 12.1x at a 256-step sync interval; flips accumulate sublinearly, so longer
-# intervals cost less per step even though each delta is larger.
-DELTA_COMPRESSION = 12.1
+# Fixed-width uint16 gaps + 4-per-byte states: a flat 2.25 bytes per flip,
+# against 2.88 for the varint encoder this replaced. 12.4x at a 256-step sync
+# interval, 48.0x at 16. Flips accumulate sublinearly, so longer intervals
+# cost less per step even though each delta is larger.
+DELTA_COMPRESSION = 12.4
 DELTA_SYNC_DEFAULT = 256
 
 # Platform (per node; the second laptop is identical)
@@ -118,6 +139,39 @@ CORES = 6
 # Below this an expert tile stops filling the vector units: the 0.1%
 # unstructured case measured 12 GFLOP/s against 150 for a proper tile.
 EXPERT_MIN_PARAMS = 512 * 1024
+
+# PER-EXPERT DATA -- A WARNING, NOT A BLOCKER, AND EXPLICITLY UNVALIDATED.
+#
+# An earlier version of this file hard-blocked any configuration below 20
+# assignments per expert parameter, derived from run_attn_probe.py, where
+# larger pools scored monotonically worse (1.9960 / 2.0735 / 2.1058 at
+# 8 / 64 / 512 experts). That gate was WRONG and is withdrawn.
+#
+# The probe could not test what it was read as testing. Its arms saw 5.3M
+# tokens against expert-parameter counts of 0.29M / 2.36M / 18.87M, i.e.
+# 18.06 / 2.26 / 0.28 tokens per parameter. The 8-expert arm sat almost
+# exactly at Chinchilla-optimal; the 512-expert arm was 71x starved. The
+# comparison was therefore between a well-trained small model and a badly
+# undertrained large one, and it would come out the same way regardless of
+# whether routing scales. On a 3.2 MB corpus no large pool CAN be trained, so
+# no pool comparison at that data scale is informative.
+#
+# The probe's own trajectory said as much and was over-read: the 512-expert
+# arm was 12.3% behind at step 1400 and 5.5% behind at 2600 -- closing, not
+# diverging. That is the signature of under-training, and this project has now
+# corrected the same premature-reading error four times.
+#
+# Dense Chinchilla also does not transfer directly. Its ~20 tokens/parameter
+# is derived where every parameter participates in every token; in a routed
+# model an expert sees roughly k/E of the stream by construction. Published
+# sparse models operate with total-parameter token ratios far below 20 and
+# still beat compute-matched dense baselines, so a hard cliff at 20 would
+# forbid architectures that demonstrably work.
+#
+# What survives: there are diminishing returns to pool size at a fixed token
+# budget, the effect is real, and its magnitude is NOT established by anything
+# measured here. So this reports rather than blocks.
+SOFT_TOKENS_PER_EXPERT_PARAM = 1.0
 
 SECONDS_PER_DAY = 86400.0
 
@@ -267,6 +321,22 @@ class Config:
         acts = self.tokens_per_step * 2048 * 4 * 3 / 1e9
         return tiles + acts
 
+    @property
+    def assignments_per_expert(self) -> float:
+        """Token-expert assignments each expert receives over training.
+
+        A pool does not merely have to fit and route -- every expert in it has
+        to be TRAINED, and each one only sees the tokens routed to it. This is
+        the quantity the token budget has to satisfy per expert, and it is
+        independent of whether the active-parameter budget is satisfied.
+        """
+        total = self.tokens * self.experts_per_token
+        return total / self.n_experts
+
+    @property
+    def tokens_per_expert_param(self) -> float:
+        return self.assignments_per_expert / self.expert_params
+
     def problems(self, max_days: float = 90.0) -> list[str]:
         out = []
         if self.expert_params < EXPERT_MIN_PARAMS:
@@ -299,6 +369,37 @@ class Config:
             out.append(f"runtime {self.days:.0f} days exceeds {max_days:.0f}")
         return out
 
+    def warnings(self) -> list[str]:
+        """Real but unquantified risks. Reported, never blocking.
+
+        Blocking on these would encode a threshold this project has not
+        measured, which is exactly the error that produced the withdrawn
+        20-tokens-per-expert-parameter gate.
+        """
+        out = []
+        r = self.tokens_per_expert_param
+        if r < SOFT_TOKENS_PER_EXPERT_PARAM:
+            out.append(
+                f"{r:.2f} assignments per expert parameter. Diminishing "
+                f"returns to pool size are real at a fixed token budget, but "
+                f"the threshold is NOT established -- see the withdrawn gate "
+                f"in this module. A pool of {self.viable_pool_size():,.0f} "
+                f"experts, or {self.tokens_for_this_pool():.2e} tokens, would "
+                f"reach {SOFT_TOKENS_PER_EXPERT_PARAM:.0f}."
+            )
+        return out
+
+    def viable_pool_size(self) -> float:
+        """Pool size that would reach the soft per-expert data target."""
+        total = self.tokens * self.experts_per_token
+        return total / (SOFT_TOKENS_PER_EXPERT_PARAM * self.expert_params)
+
+    def tokens_for_this_pool(self) -> float:
+        """Token budget that would bring this pool to the soft target."""
+        need = (SOFT_TOKENS_PER_EXPERT_PARAM * self.expert_params
+                * self.n_experts)
+        return need / self.experts_per_token
+
     def feasible(self, max_days: float = 90.0) -> bool:
         return not self.problems(max_days)
 
@@ -325,6 +426,8 @@ def report(name: str, c: Config) -> None:
     print(f"  verdict             {'FEASIBLE' if not probs else 'BLOCKED'}")
     for p in probs:
         print(f"      - {p}")
+    for w in c.warnings():
+        print(f"      ! {w}")
 
 
 BASE = dict(
@@ -358,16 +461,25 @@ def main() -> None:
                  **BASE)
     report("TWO NODES, data-parallel with ternary delta sync", dpd)
 
-    print(f"\n  speedup vs one node   {single.days / best.days:.2f}x "
-          f"({single.days:.1f} -> {best.days:.1f} days)")
-    print(f"  storage per node      {single.storage_per_node_gb:.1f} GB -> "
-          f"{best.storage_per_node_gb:.1f} GB")
+    print(f"\n  assignments per expert   "
+          f"{dpd.assignments_per_expert:.2e}")
+    print(f"  per expert PARAM         "
+          f"{dpd.tokens_per_expert_param:.2f} "
+          f"(soft target {SOFT_TOKENS_PER_EXPERT_PARAM:.0f}, not a gate)")
+
+    print("\n  The per-expert data ratio is reported as a WARNING above.")
+    print("  It was briefly a hard gate at 20 tokens/expert-param, which")
+    print("  blocked this design. That gate came from a probe whose own arms")
+    print("  were 18.06 / 2.26 / 0.28 tokens per parameter -- it compared a")
+    print("  Chinchilla-optimal small model against a 71x starved large one,")
+    print("  so it could not measure routing at all. Gate withdrawn.")
+
     print(f"\n  sharded {best.days:.1f} d but each token routes among "
           f"{best.n_experts / 2:,.0f} experts;")
     print(f"  delta-sync {dpd.days:.1f} d with all {dpd.n_experts:,.0f} "
           f"reachable.")
-    print("  Measured routing cost of sharding at a converged horizon:")
-    print("  1.52x worse loss at 512 experts, 1.12x at 2048.")
+    print("  Measured routing cost of sharding, real corpus with an")
+    print("  attention trunk: 2.3174 against 2.1058, a 10.0% penalty.")
 
 
 if __name__ == "__main__":
