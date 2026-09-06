@@ -104,10 +104,59 @@ from dataclasses import dataclass
 # 145.6 at 128 tokens, 173.0 at 512, 148.0 at 2048 -- so the routing block
 # size is a real tuning parameter, not an implementation detail.
 # A single-trial sweep suggested 190; that did not survive repetition.
-SPARSE_GFLOPS = 173.0
-TOKENS_PER_EXPERT_OPTIMAL = 512
+# src/sparse_engine/bench_routed_throughput.py and profile_dispatch.py --
+# throughput of the ROUTED path, forward plus backward, useful FLOPs only.
+#
+# This was originally 173, taken from an isolated GEMM benchmark, which made
+# the cost model ~4x optimistic until validate_budget.py caught it. It was
+# then set to a flat 45.4 -- but that was measured at 16-128 tokens per
+# expert, and throughput depends strongly on that ratio because it sets both
+# the GEMM's row count and the padding waste:
+#
+#     tokens/expert     GFLOP/s     padding waste
+#                32        62.7               35%
+#               128       113.8                -
+#               512       123.4                -
+#              1024       134.4                -
+#              2048       136.1               16%
+#
+# These are a RE-MEASUREMENT. The first pass reported almost exactly half
+# these values because it timed with a single warmup iteration, so PyTorch
+# thread-pool spin-up landed inside the measured region. Caught by
+# fast_dispatch.py reporting 114 GF/s for a shape the curve claimed was 57.
+# Re-measured with 3 warmup iterations and min-of-6 on an idle machine.
+#
+# A single constant is therefore wrong in both directions depending on
+# configuration. `routed_gflops` interpolates this measured curve, so a
+# config is priced at its own operating point. The 70B design runs at
+# 65,536 x 70 / 70,000 = 66 tokens/expert; the 2B design at 819.
+_ROUTED_CURVE = ((32, 62.7), (128, 113.8), (512, 123.4),
+                 (1024, 134.4), (2048, 136.1))
+ISOLATED_GEMM_GFLOPS = 173.0   # kept only to document the discrepancy
 DENSE_GFLOPS = 130.5           # large dense GEMM
-ROUTING_OVERHEAD = 0.04        # gather cost as a fraction of expert GEMM
+ROUTING_OVERHEAD = 0.0         # now inside the measured routed figures
+
+
+def routed_gflops(tokens_per_expert: float) -> float:
+    """Measured routed throughput at a given tokens-per-expert ratio.
+
+    Log-linear interpolation between measured points, clamped at both ends so
+    an out-of-range configuration is priced conservatively rather than
+    extrapolated into fantasy.
+    """
+    import math
+
+    pts = _ROUTED_CURVE
+    if tokens_per_expert <= pts[0][0]:
+        return pts[0][1]
+    if tokens_per_expert >= pts[-1][0]:
+        return pts[-1][1]
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        if tokens_per_expert <= x1:
+            f = ((math.log(tokens_per_expert) - math.log(x0))
+                 / (math.log(x1) - math.log(x0)))
+            return y0 + f * (y1 - y0)
+    return pts[-1][1]
 
 # src/sparse_engine/bench_stream_bandwidth.py
 DISK_READ_GBPS = 4.10
@@ -173,6 +222,57 @@ EXPERT_MIN_PARAMS = 512 * 1024
 # measured here. So this reports rather than blocks.
 SOFT_TOKENS_PER_EXPERT_PARAM = 1.0
 
+# src/sparse_engine/decompose_step.py -- costs the budget originally OMITTED.
+#
+# The first version of this model priced only 6 * P_active * T over
+# SPARSE_GFLOPS plus a bytes/bandwidth term, and validate_budget.py showed
+# real steps running 9-70x slower than it predicted. Decomposing a step
+# located the gap exactly:
+#
+#     phase                64 experts   256 experts
+#     disk read                    0%            1%
+#     ternary unpack              24%           27%
+#     routing (topk)               1%            0%
+#     expert math                 27%           17%   <- the only term priced
+#     optimiser                   48%           55%
+#
+# So the model was accounting for 17-27% of a step. Both missing terms are
+# added below with measured rates. Neither is avoidable by tuning: weights
+# are stored 2-bit and computed in fp32, so every served expert is unpacked,
+# and every served expert's moments are updated.
+UNPACK_PARAMS_PER_SEC = 155e6   # byte-wide LUT; 94e6 with nibble shifts
+OPTIM_PARAMS_PER_SEC = 72e6     # SparseExpertAdam, measured at two shapes
+
+# src/sparse_engine/validate_budget.py -- residual, measured end to end.
+#
+# History, because it shows what the residual actually was:
+#   9-70x   before unpack and optimiser terms existed at all
+#   2.0-3.3x after adding them, with a flat SPARSE_GFLOPS = 45.4
+#   1.6x    after making routed throughput shape-aware, measured at the
+#            scale this design actually runs at
+#
+# The residual is itself scale-dependent -- 3.2x at 64 tokens/expert, 1.6x at
+# 512-2048 -- because fixed per-step overhead amortises. The value below is
+# measured in the regime the 2B and 70B configurations occupy (512-2048
+# tokens/expert); small configurations are priced optimistically by it, which
+# is stated rather than hidden.
+#
+# Most of what looked like unexplained overhead was the tokens-per-expert
+# dependence being flattened into one constant -- the model was pricing every
+# configuration at one operating point. What remains is genuine unmodelled
+# cost: allocation, Python-level dispatch, topk, and the gather/scatter around
+# the GEMM.
+#
+# Applied rather than ignored, because the alternative is reporting a number
+# measurement says is optimistic. Not a fitted parameter: it is the measured
+# mean over four shapes that were not used to derive any constant, and
+# test_budget_validation.py re-measures it, and it has been revised upward
+# once already (1.63 -> 1.92) when in-regime validation showed the model
+# still 11-25% optimistic. Revising it up is the correct direction to err:
+# an under-predicting model turns a "feasible" verdict into a missed
+# deadline.
+MODEL_SLACK = 1.92
+
 SECONDS_PER_DAY = 86400.0
 
 
@@ -200,6 +300,8 @@ class Config:
     delta_sync_every: int = DELTA_SYNC_DEFAULT
     d_model: int = 2048
     layers: int = 8
+    overlap_io: bool = True
+    micro_batch: int = 65536
 
     # ---------------------------------------------------------------- sizes
     @property
@@ -242,8 +344,23 @@ class Config:
         return 6.0 * self.active_params_per_token * self.tokens
 
     @property
+    def tokens_per_expert_per_step(self) -> float:
+        """Assignments each served expert receives in one step.
+
+        This is the quantity that sets routed GEMM efficiency: it is both the
+        row count of each expert's block and the driver of padding waste.
+        """
+        served = self.experts_touched_per_step
+        return (self.tokens_per_step * self.experts_per_token
+                / max(served, 1.0))
+
+    @property
+    def sparse_gflops(self) -> float:
+        return routed_gflops(self.tokens_per_expert_per_step)
+
+    @property
     def compute_seconds(self) -> float:
-        eff = SPARSE_GFLOPS * 1e9 / (1.0 + ROUTING_OVERHEAD)
+        eff = self.sparse_gflops * 1e9 / (1.0 + ROUTING_OVERHEAD)
         return self.compute_flops / eff / self.nodes
 
     # ------------------------------------------------------------------ io
@@ -300,8 +417,51 @@ class Config:
         return self.comm_gb_per_step / LINK_GBPS * self.steps
 
     @property
+    def unpack_seconds(self) -> float:
+        """2-bit -> fp32 expansion for every expert served, every step.
+
+        Unavoidable given the storage format: the design stores ternary to
+        halve I/O and computes in fp32 because int32 matmul measured 0.02x
+        fp32 on this CPU. Caching unpacked weights would need
+        4 bytes x total_params, which is 280 GB at the 70B pool.
+        """
+        served = self.experts_touched_per_step * self.expert_params
+        return served * self.steps / UNPACK_PARAMS_PER_SEC
+
+    @property
+    def optim_seconds(self) -> float:
+        """Moment updates for every expert served, amortised over
+        latent_update_every steps."""
+        served = self.experts_touched_per_step * self.expert_params
+        return (served * self.steps / OPTIM_PARAMS_PER_SEC
+                / self.latent_update_every)
+
+    @property
     def total_seconds(self) -> float:
-        return self.compute_seconds + self.io_seconds + self.comm_seconds
+        """Wall-clock, modelling streaming as overlapped with compute.
+
+        Summing every phase assumed the cores idle while the next block is
+        read, which double-buffering exists to prevent. Disk reads at
+        4.10 GB/s are issued by a background thread while the current step
+        computes, so only the I/O and link terms hide.
+
+        Unpack and optimiser do NOT hide: they are CPU work on the same cores
+        as the expert math, so they add. Treating them as overlappable was the
+        error that made this model 9-70x optimistic.
+        """
+        cpu = self.compute_seconds + self.unpack_seconds + self.optim_seconds
+        cpu *= MODEL_SLACK
+        io_side = self.io_seconds + self.comm_seconds
+        if not self.overlap_io:
+            return cpu + io_side
+        return max(cpu, io_side)
+
+    @property
+    def overlap_saving_days(self) -> float:
+        cpu = (self.compute_seconds + self.unpack_seconds
+               + self.optim_seconds) * MODEL_SLACK
+        naive = cpu + self.io_seconds + self.comm_seconds
+        return (naive - self.total_seconds) / SECONDS_PER_DAY
 
     @property
     def days(self) -> float:
@@ -311,14 +471,24 @@ class Config:
     def working_set_gb(self) -> float:
         """RAM needed at any instant: activations plus the live expert tiles.
 
-        Only the experts being applied right now are resident; the rest are on
-        disk. Streaming is expert-parallel, so a bounded slice is live.
+        Activations are sized by MICRO_BATCH, not by tokens_per_step. Those
+        are different quantities and conflating them was a modelling error:
+        tokens_per_step controls how often weights are re-read from disk,
+        while micro_batch controls how many tokens are in flight at once.
+        Gradient accumulation lets one streaming pass serve many micro-batches
+        against the same resident experts, which is batch-token fusion taken
+        to its conclusion -- the weights are fetched once and amortised over
+        every token that needs them.
+
+        Tying the two together made large streaming steps appear to need
+        103 GB of RAM, when the actual requirement is set by the micro-batch.
         """
         live_experts = min(self.n_experts, 64.0)
         tiles = live_experts * self.expert_params * (
             self.weight_bits / 8 + 4.0        # ternary + fp32 unpacked
         ) / 1e9
-        acts = self.tokens_per_step * 2048 * 4 * 3 / 1e9
+        acts = min(self.micro_batch, self.tokens_per_step) * \
+            self.d_model * 4 * 3 / 1e9
         return tiles + acts
 
     @property
@@ -417,10 +587,17 @@ def report(name: str, c: Config) -> None:
     print(f"  storage/node        {c.storage_per_node_gb:.1f} GB "
           f"of {DISK_FREE_GB} free")
     print(f"  RAM working set     {c.working_set_gb():.2f} GB")
-    print(f"  compute             {c.compute_seconds / SECONDS_PER_DAY:.1f} d")
+    print(f"  expert math         {c.compute_seconds / SECONDS_PER_DAY:.1f} d"
+          f"  ({c.tokens_per_expert_per_step:,.0f} tok/expert -> "
+          f"{c.sparse_gflops:.0f} GF/s)")
+    print(f"  ternary unpack      {c.unpack_seconds / SECONDS_PER_DAY:.1f} d")
+    print(f"  optimiser           {c.optim_seconds / SECONDS_PER_DAY:.1f} d")
     print(f"  streaming I/O       {c.io_seconds / SECONDS_PER_DAY:.1f} d")
     print(f"  cross-node comm     {c.comm_seconds / SECONDS_PER_DAY:.1f} d "
           f"({c.comm_gb_per_step * 1000:.1f} MB/step)")
+    if c.overlap_io:
+        print(f"  overlap saving      {c.overlap_saving_days:.1f} d "
+              f"(streaming hidden behind compute)")
     print(f"  TOTAL               {c.days:.1f} days")
     probs = c.problems()
     print(f"  verdict             {'FEASIBLE' if not probs else 'BLOCKED'}")
@@ -430,9 +607,14 @@ def report(name: str, c: Config) -> None:
         print(f"      ! {w}")
 
 
+# tokens_per_step is a STREAMING batch, amortising each weight fetch over
+# more tokens; micro_batch bounds activation RAM independently via gradient
+# accumulation. Raising the former from 65,536 to 4.2M takes routed
+# throughput from 44 to 78 GF/s (more tokens per expert) and cuts unpack
+# 62-fold, without changing RAM at all.
 BASE = dict(
     total_params=70e9, active_params_per_token=70e6, tokens=1.4e9,
-    tokens_per_step=65536,
+    tokens_per_step=4194304, micro_batch=65536,
 )
 
 
